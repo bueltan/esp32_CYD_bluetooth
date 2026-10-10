@@ -1,0 +1,632 @@
+#include <Arduino.h>
+#include <SPI.h>
+
+#include "AudioTools.h"
+#include "AudioTools/Disk/AudioSourceSD.h"
+#include "AudioTools/AudioCodecs/CodecMP3Helix.h"
+
+#include <BluetoothA2DPSource.h>
+
+
+// ======================================================
+// SD - CYD ESP32-2432S028
+// ======================================================
+
+#define SD_CS    5
+#define SD_SCK   18
+#define SD_MISO  19
+#define SD_MOSI  23
+
+
+// ======================================================
+// Formato esperado
+// ======================================================
+
+static constexpr uint32_t EXPECTED_RATE = 48000;
+static constexpr uint16_t EXPECTED_CHANNELS = 2;
+static constexpr uint16_t EXPECTED_BITS = 16;
+
+
+// ======================================================
+// Buffer PCM
+// ======================================================
+
+static constexpr size_t BUFFER_SIZE =
+    32 * 1024;
+
+BufferRTOS<uint8_t> buffer(0);
+
+QueueStream<uint8_t> out(buffer);
+
+
+// ======================================================
+// Logger del formato detectado por Helix
+// ======================================================
+
+class AudioInfoLogger : public AudioInfoSupport
+{
+public:
+
+    void setAudioInfo(AudioInfo info) override
+    {
+        currentInfo = info;
+
+        Serial.println();
+        Serial.println(
+            "========== AUDIO INFO =========="
+        );
+
+        Serial.print(
+            "Sample rate: "
+        );
+        Serial.print(
+            info.sample_rate
+        );
+        Serial.println(
+            " Hz"
+        );
+
+        Serial.print(
+            "Channels: "
+        );
+        Serial.println(
+            info.channels
+        );
+
+        Serial.print(
+            "Bits per sample: "
+        );
+        Serial.println(
+            info.bits_per_sample
+        );
+
+
+        if (
+            info.sample_rate == EXPECTED_RATE &&
+            info.channels == EXPECTED_CHANNELS &&
+            info.bits_per_sample == EXPECTED_BITS
+        )
+        {
+            Serial.println(
+                "OK: 48000 Hz / stereo / 16-bit"
+            );
+        }
+        else
+        {
+            Serial.println(
+                "ATENCION: formato distinto de 48000/2/16"
+            );
+        }
+
+        Serial.println(
+            "================================"
+        );
+        Serial.println();
+    }
+
+
+    AudioInfo audioInfo() override
+    {
+        return currentInfo;
+    }
+
+
+private:
+
+    AudioInfo currentInfo;
+};
+
+
+AudioInfoLogger audioInfoLogger;
+
+
+// ======================================================
+// MP3
+// ======================================================
+
+AudioSourceSD source(
+    "/music",
+    "mp3",
+    SD_CS
+);
+
+MP3DecoderHelix decoder;
+
+
+// ======================================================
+// Player
+// ======================================================
+//
+// SD
+//   ↓
+// MP3
+//   ↓
+// Helix
+//   ↓
+// PCM 48 kHz
+//   ↓
+// Queue
+//
+
+AudioPlayer player(
+    source,
+    out,
+    decoder
+);
+
+
+// ======================================================
+// Bluetooth A2DP
+// ======================================================
+
+BluetoothA2DPSource a2dp;
+
+
+// ======================================================
+// SBC encoder
+// ======================================================
+//
+// Este es el punto importante.
+//
+// Le indicamos al encoder SBC:
+// PCM de entrada = 48000 Hz
+//
+
+
+
+// ======================================================
+// Estadísticas
+// ======================================================
+
+volatile uint32_t callbackCount = 0;
+volatile uint32_t underruns = 0;
+
+volatile size_t ultimoPedido = 0;
+volatile size_t ultimoLeido = 0;
+
+
+// ======================================================
+// Callback A2DP
+// ======================================================
+
+int32_t get_audio_data(
+    uint8_t *data,
+    int32_t len
+)
+{
+    callbackCount++;
+
+
+    size_t disponibles =
+        buffer.available();
+
+
+    size_t cantidad =
+        min(
+            (size_t)len,
+            disponibles
+        );
+
+
+    size_t leidos =
+        buffer.readArray(
+            data,
+            cantidad
+        );
+
+
+    ultimoPedido =
+        len;
+
+    ultimoLeido =
+        leidos;
+
+
+    if (
+        leidos <
+        (size_t)len
+    )
+    {
+        underruns++;
+    }
+
+
+    return leidos;
+}
+
+
+// ======================================================
+// SETUP
+// ======================================================
+
+void setup()
+{
+    Serial.begin(
+        115200
+    );
+
+
+    delay(
+        1000
+    );
+
+
+    Serial.println();
+    Serial.println(
+        "===================================="
+    );
+    Serial.println(
+        " MP3 48k -> PCM -> Buffer -> A2DP"
+    );
+    Serial.println(
+        "===================================="
+    );
+
+
+    // ==================================================
+    // Logging
+    // ==================================================
+
+    AudioToolsLogger.begin(
+        Serial,
+        AudioToolsLogLevel::Warning
+    );
+
+
+    // ==================================================
+    // Heap inicial
+    // ==================================================
+
+    Serial.print(
+        "Heap inicial: "
+    );
+
+    Serial.println(
+        ESP.getFreeHeap()
+    );
+
+
+    // ==================================================
+    // SD
+    // ==================================================
+
+    Serial.println();
+    Serial.println(
+        "Inicializando SPI..."
+    );
+
+
+    SPI.begin(
+        SD_SCK,
+        SD_MISO,
+        SD_MOSI,
+        SD_CS
+    );
+
+
+    // ==================================================
+    // Buffer
+    // ==================================================
+
+    Serial.print(
+        "Heap antes buffer: "
+    );
+
+    Serial.println(
+        ESP.getFreeHeap()
+    );
+
+
+    buffer.resize(
+        BUFFER_SIZE
+    );
+
+
+    Serial.print(
+        "Heap despues buffer: "
+    );
+
+    Serial.println(
+        ESP.getFreeHeap()
+    );
+
+
+    /*
+     * Esperamos a tener bastante PCM antes
+     * de que QueueStream comience a entregar datos.
+     */
+    out.begin(
+        90
+    );
+
+
+    // ==================================================
+    // Audio format logger
+    // ==================================================
+
+    decoder.addNotifyAudioChange(
+        audioInfoLogger
+    );
+
+
+    // ==================================================
+    // Player
+    // ==================================================
+
+    Serial.println();
+    Serial.println(
+        "Inicializando MP3 player..."
+    );
+
+
+    player.setVolume(
+        1.0
+    );
+
+
+    player.setDelayIfOutputFull(
+        0
+    );
+
+
+    if (
+        !player.begin()
+    )
+    {
+        Serial.println(
+            "ERROR: player.begin()"
+        );
+
+        while (true)
+        {
+            delay(
+                1000
+            );
+        }
+    }
+
+
+    player.setIndex(
+        0
+    );
+
+
+    Serial.println(
+        "Player iniciado."
+    );
+
+
+    // ==================================================
+    // Pre-buffer
+    // ==================================================
+
+    Serial.println();
+    Serial.println(
+        "Prellenando buffer PCM..."
+    );
+
+
+    const size_t objetivo =
+        BUFFER_SIZE * 3 / 4;
+
+
+    uint32_t inicio =
+        millis();
+
+
+    while (
+        buffer.available() <
+        objetivo
+    )
+    {
+        player.copy();
+
+
+        if (
+            millis() - inicio >
+            5000
+        )
+        {
+            Serial.println(
+                "Timeout pre-buffer"
+            );
+
+            break;
+        }
+    }
+
+
+    Serial.print(
+        "PCM precargado: "
+    );
+
+    Serial.print(
+        buffer.available()
+    );
+
+    Serial.print(
+        " / "
+    );
+
+    Serial.println(
+        BUFFER_SIZE
+    );
+
+
+    // ==================================================
+    // Configurar SBC a 48000
+    // ==================================================
+
+    Serial.println();
+    Serial.println(
+        "Configurando SBC a 48000 Hz..."
+    );
+
+
+
+
+    // ==================================================
+    // Callback PCM
+    // ==================================================
+
+    a2dp.set_data_callback(
+        get_audio_data
+    );
+
+
+    // ==================================================
+    // Volume
+    // ==================================================
+
+    a2dp.set_volume(
+        127
+    );
+
+
+    // ==================================================
+    // Reconexión
+    // ==================================================
+
+    a2dp.set_auto_reconnect(
+        true,
+        5
+    );
+
+
+    // ==================================================
+    // Start
+    // ==================================================
+
+    Serial.println(
+        "Conectando a WH-CH720N..."
+    );
+
+
+    a2dp.start(
+        "WH-CH720N"
+    );
+
+
+    Serial.println(
+        "Bluetooth iniciado."
+    );
+
+
+    Serial.print(
+        "Heap despues A2DP: "
+    );
+
+    Serial.println(
+        ESP.getFreeHeap()
+    );
+}
+
+
+// ======================================================
+// LOOP
+// ======================================================
+
+void loop()
+{
+    // MP3 -> Helix -> PCM -> buffer
+    player.copy();
+
+
+    // ==================================================
+    // Diagnóstico
+    // ==================================================
+
+    static uint32_t ultimoLog =
+        0;
+
+
+    if (
+        millis() - ultimoLog >=
+        3000
+    )
+    {
+        ultimoLog =
+            millis();
+
+
+        Serial.println();
+        Serial.println(
+            "---------- AUDIO STATUS ----------"
+        );
+
+
+        Serial.print(
+            "Buffer: "
+        );
+
+        Serial.print(
+            buffer.available()
+        );
+
+        Serial.print(
+            " / "
+        );
+
+        Serial.println(
+            BUFFER_SIZE
+        );
+
+
+        Serial.print(
+            "A2DP callbacks: "
+        );
+
+        Serial.println(
+            callbackCount
+        );
+
+
+        Serial.print(
+            "Underruns: "
+        );
+
+        Serial.println(
+            underruns
+        );
+
+
+        Serial.print(
+            "Ultimo pedido: "
+        );
+
+        Serial.print(
+            ultimoPedido
+        );
+
+        Serial.println(
+            " bytes"
+        );
+
+
+        Serial.print(
+            "Ultima lectura: "
+        );
+
+        Serial.print(
+            ultimoLeido
+        );
+
+        Serial.println(
+            " bytes"
+        );
+
+
+        Serial.print(
+            "Heap libre: "
+        );
+
+        Serial.println(
+            ESP.getFreeHeap()
+        );
+
+
+        Serial.println(
+            "----------------------------------"
+        );
+    }
+}
